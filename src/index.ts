@@ -7,6 +7,10 @@ import {
 import { $ } from "zx";
 import fs from "fs/promises";
 import path from "path";
+import { exec } from "child_process";
+import { promisify } from "util";
+
+const execAsync = promisify(exec);
 
 const server = new Server(
   {
@@ -653,6 +657,639 @@ def test_email_validation(email, status):
   return files;
 }
 
+const GHIDRA_PATH = process.env.GHIDRA_PATH || "/opt/ghidra";
+const YARA_PATH = process.env.YARA_PATH || "yara";
+const YARA_RULES_PATH = process.env.YARA_RULES_PATH || "./rules";
+const outputDir = "/tmp/mcp_re";
+
+interface DecompiledFunction {
+  name: string;
+  signature: string;
+  address: string;
+  code: string;
+}
+
+interface BinaryInfo {
+  fileType: string;
+  architecture: string;
+  entryPoint: string;
+  sections: { name: string; address: string; size: string }[];
+  imports: string[];
+  exports: string[];
+}
+
+async function getBinaryInfo(filePath: string): Promise<BinaryInfo> {
+  const info: BinaryInfo = {
+    fileType: "",
+    architecture: "",
+    entryPoint: "",
+    sections: [],
+    imports: [],
+    exports: []
+  };
+
+  try {
+    const { stdout: fileType } = await execAsync(`file -b "${filePath}"`);
+    info.fileType = fileType.trim();
+
+    const { stdout: readelf } = await execAsync(`readelf -h "${filePath}" 2>/dev/null`);
+    
+    const archMatch = readelf.match(/Machine:\s+(.+)/);
+    if (archMatch) info.architecture = archMatch[1].trim();
+
+    const entryMatch = readelf.match(/Entry point\s+0x([0-9a-fA-F]+)/);
+    if (entryMatch) info.entryPoint = "0x" + entryMatch[1];
+
+    const { stdout: sections } = await execAsync(`readelf -S "${filePath}" 2>/dev/null`);
+    const sectionMatches = sections.matchAll(/\[.*?\]\s+(\S+)\s+([0-9a-fA-F]+)\s+([0-9a-fA-F]+)/g);
+    for (const match of sectionMatches) {
+      info.sections.push({
+        name: match[1],
+        address: "0x" + match[2],
+        size: "0x" + match[3]
+      });
+    }
+
+    const { stdout: imports } = await execAsync(`readelf -s "${filePath}" 2>/dev/null | grep UNIQUE`);
+    const importMatches = imports.matchAll(/Symbol.*?:\s+\d+\s+.*?\s+(\S+)/g);
+    for (const match of importMatches) {
+      if (!info.imports.includes(match[1])) info.imports.push(match[1]);
+    }
+    info.imports = info.imports.slice(0, 50);
+
+  } catch (e) {}
+
+  return info;
+}
+
+async function extractStrings(filePath: string, minLength: number = 4): Promise<string[]> {
+  const strings: string[] = [];
+  try {
+    const { stdout } = await execAsync(`strings -n ${minLength} "${filePath}"`);
+    strings.push(...stdout.trim().split("\n").filter(s => s.length > 0));
+  } catch (e) {}
+  return strings;
+}
+
+async function checkSec(filePath: string): Promise<Record<string, boolean>> {
+  const results: Record<string, boolean> = {
+    canary: false,
+    nx: false,
+    pie: false,
+    relro: false,
+    rpath: false,
+    runpath: false,
+    symbols: false,
+    fortified: false
+  };
+
+  try {
+    const checksecPath = await execAsync("which checksec 2>/dev/null").then(r => r.stdout.trim()).catch(() => "");
+    
+    if (checksecPath) {
+      const { stdout } = await execAsync(`checksec --file="${filePath}"`);
+      results.canary = stdout.includes("Canary: YES");
+      results.nx = stdout.includes("NX: YES");
+      results.pie = stdout.includes("PIE: YES");
+      results.relro = stdout.includes("Full RELRO");
+      results.symbols = !stdout.includes("Symbols: No");
+    } else {
+      const { stdout } = await execAsync(`readelf -l "${filePath}" 2>/dev/null`);
+      results.nx = stdout.includes("GNU_STACK");
+
+      const { stdout: relro } = await execAsync(`readelf -d "${filePath}" 2>/dev/null`);
+      results.relro = relro.includes("BIND_NOW") || relro.includes("RELRO");
+      
+      const { stdout: dyn } = await execAsync(`readelf -d "${filePath}" 2>/dev/null`);
+      results.rpath = dyn.includes("RPATH");
+      results.runpath = dyn.includes("RUNPATH");
+    }
+  } catch (e) {}
+
+  return results;
+}
+
+async function runGhidraAnalyze(filePath: string, analysisType: string = "basic"): Promise<string> {
+  const projectName = "mcp_analysis";
+  const outputDir = "/tmp/ghidra_output";
+  await fs.mkdir(outputDir, { recursive: true });
+
+  const scriptName = analysisType === "full" ? "AnalyzeFile" : "BasicAnalysis";
+  
+  const ghidraScript = `
+import ghidra.app.script.GhidraScript;
+import ghidra.program.model.listing.*;
+import ghidra.app.analysis.*;
+
+public class ${scriptName} extends GhidraScript {
+  public void run() throws Exception {
+    Listing listing = currentProgram.getListing();
+    FunctionIterator funcs = listing.getFunctions(true);
+    StringBuilder sb = new StringBuilder();
+    
+    sb.append("## Functions (\\n");
+    while (funcs.hasNext()) {
+      Function f = funcs.next();
+      sb.append("- ").append(f.getName())
+        .append(" @ ").append(f.getEntryPoint())
+        .append("\\n");
+    }
+    sb.append(")\\n\\n");
+    
+    sb.append("## Strings\\n");
+    try {
+      for (String s : getStrings(currentProgram.getMemory())) {
+        if (s.length() > 6) {
+          sb.append("- ").append(s).append("\\n");
+        }
+      }
+    } catch (Exception e) {}
+    
+    sb.append("\\n## Security\\n");
+    sb.append("- Canary: ").append(checkForStackCanaries()).append("\\n");
+    sb.append("- NX: ").append(checkForNX()).append("\\n");
+    sb.append("- PIE: ").append(checkForPIE()).append("\\n");
+    
+    writeFile("analysis_results.md", sb.toString());
+  }
+  
+  private boolean checkForStackCanaries() {
+    return currentProgram.getProgramModule().getName().contains("canary");
+  }
+  
+  private boolean checkForNX() {
+    try {
+      return currentProgram.getMemory().getMaxAddress().toString().contains("nx");
+    } catch (Exception e) { return false; }
+  }
+  
+  private boolean checkForPIE() {
+    return currentProgram.getImageBase().getOffset() == 0;
+  }
+}
+`;
+
+  try {
+    await fs.writeFile(path.join(outputDir, `${scriptName}.java`), ghidraScript);
+    
+    const cmd = `${GHIDRA_PATH}/support/analyzeHeadless \
+      /tmp/ghidra_project ${projectName} \
+      -import "${filePath}" \
+      -overwrite \
+      -scriptPath ${outputDir} \
+      -postScript ${scriptName}.java`;
+
+    const { stdout, stderr } = await execAsync(cmd);
+    
+    const resultsFile = path.join(outputDir, "analysis_results.md");
+    try {
+      return await fs.readFile(resultsFile, "utf-8");
+    } catch {
+      return `Ghidra analysis completed.\n\nRaw output:\n${stdout}\n${stderr}`;
+    }
+  } catch (e: any) {
+    return `Ghidra analysis error: ${e.message}\n\nMake sure GHIDRA_PATH is set correctly.`;
+  }
+}
+
+async function decompileWithGhidra(filePath: string, functionName?: string): Promise<string> {
+  const decompDir = "/tmp/ghidra_decomp";
+  await fs.mkdir(decompDir, { recursive: true });
+
+  const funcFilter = functionName || "main";
+
+  const decompileScript = [
+    "import ghidra.app.script.GhidraScript;",
+    "import ghidra.program.model.listing.*;",
+    "import ghidra.app.decompiler.*;",
+    "",
+    "public class DecompileFunc extends GhidraScript {",
+    "  public void run() throws Exception {",
+    "    Listing listing = currentProgram.getListing();",
+    "    Decompiler decomp = new Decompiler();",
+    "    decomp.initialize(currentProgram);",
+    "    ",
+    "    StringBuilder sb = new StringBuilder();",
+    "    sb.append(\"## Decompiled Functions\\n\\n\");",
+    "    ",
+    "    FunctionIterator funcs = listing.getFunctions(true);",
+    "    while (funcs.hasNext()) {",
+    "      Function f = funcs.next();",
+    "      String fname = f.getName();",
+    "      sb.append(\"### \").append(f.getName())",
+    "        .append(\" @ \").append(f.getEntryPoint())",
+    "        .append(\"\\n\\n\");",
+    "      ",
+    "      try {",
+    "        DecompileResult res = decomp.decompileFunction(f, 30, null);",
+    "        sb.append(\"```c\\n\").append(res.getDecompiledFunction().getC()).append(\"\\n```\\n\\n\");",
+    "      } catch (Exception e) {",
+    "        sb.append(\"Error: \").append(e.getMessage()).append(\"\\n\\n\");",
+    "      }",
+    "    }",
+    "    ",
+    "    writeFile(\"decompiled.md\", sb.toString());",
+    "  }",
+    "}"
+  ].join("\n");
+
+  try {
+    await fs.writeFile(path.join(decompDir, "DecompileFunc.java"), decompileScript);
+    
+    const cmd = `${GHIDRA_PATH}/support/analyzeHeadless /tmp/ghidra_project decompile -import "${filePath}" -overwrite -scriptPath ${decompDir} -postScript DecompileFunc.java`;
+
+    const { stdout, stderr } = await execAsync(cmd);
+    
+    const resultsFile = path.join(decompDir, "decompiled.md");
+    try {
+      return await fs.readFile(resultsFile, "utf-8");
+    } catch {
+      return `Decompiled output:\n${stdout}\n\nErrors:\n${stderr}`;
+    }
+  } catch (e: any) {
+    return `Decompilation error: ${e.message}`;
+  }
+}
+
+async function scanWithYara(filePath: string, rulesPath?: string): Promise<{ matches: string[], rules: string[] }> {
+  const matches: string[] = [];
+  const rules: string[] = [];
+
+  try {
+    const rulesDir = rulesPath || YARA_RULES_PATH;
+    
+    const defaultRules = `
+rule suspicious_entropy {
+  strings:
+    $high_entropy = /[A-Za-z0-9+\/=]{50,}/
+  condition:
+    any of them
+}
+
+rule shellcode_patterns {
+  strings:
+    $sc1 = { 31 C0 50 68 ?? ?? ?? ?? }
+    $sc2 = { 90 90 90 FF D0 }
+  condition:
+    any of them
+}
+
+rule crypto_constants {
+  strings:
+    $rc4 = "RC4"
+    $aes = "AES"
+    $md5 = "MD5"
+    $sha = "SHA"
+  condition:
+    any of them
+}
+
+rule network_indicators {
+  strings:
+    $http = "http://"
+    $https = "https://"
+    $socket = "socket("
+    $connect = "connect("
+  condition:
+    any of them
+}
+
+rule encoding_indicators {
+  strings:
+    $base64 = /[A-Za-z0-9+\/]{20,}={0,2}/
+    $hex = /\\x[0-9a-fA-F]{2}/
+  condition:
+    any of them
+}
+
+rule packed_binary {
+  strings:
+    $upx = "UPX"
+    $aspack = ".aspack"
+    $petite = ".petite"
+  condition:
+    any of them
+}
+
+rule api_hashing {
+  strings:
+    $hash = /GetProcAddress|LoadLibrary/
+  condition:
+    any of them
+}
+
+rule obfuscated_strings {
+  strings:
+    $obf1 = /char\\s+\\w+\\[\\d+\\]\\s*=\\s*\\{/
+  condition:
+    any of them
+}
+`;
+
+    const rulesFile = path.join("/tmp", "mcp_yara_rules.yar");
+    await fs.writeFile(rulesFile, defaultRules);
+
+    const { stdout } = await execAsync(`yara -r "${rulesFile}" "${filePath}" 2>/dev/null`);
+    matches.push(...stdout.trim().split("\n").filter(m => m.length > 0));
+    
+    const rulesDirExists = await fs.access(rulesDir).then(() => true).catch(() => false);
+    if (rulesDirExists) {
+      const yaraFiles = await fs.readdir(rulesDir).then(f => f.filter(f => f.endsWith(".yar") || f.endsWith(".yara")));
+      for (const yf of yaraFiles) {
+        const { stdout: yaraOut } = await execAsync(`yara -r "${path.join(rulesDir, yf)}" "${filePath}" 2>/dev/null`);
+        matches.push(...yaraOut.trim().split("\n").filter(m => m.length > 0));
+      }
+    }
+
+    rules.push("suspicious_entropy", "shellcode_patterns", "crypto_constants", "network_indicators", "encoding_indicators", "packed_binary", "api_hashing", "obfuscated_strings");
+
+  } catch (e: any) {
+    return { matches: [`Yara scan error: ${e.message}`], rules: [] };
+  }
+
+  return { matches, rules };
+}
+
+async function extractStringsAndAnalyze(filePath: string): Promise<string> {
+  const strings = await extractStrings(filePath, 5);
+  const binaryInfo = await getBinaryInfo(filePath);
+  const security = await checkSec(filePath);
+  
+  let report = `## Binary Analysis: ${path.basename(filePath)}\n\n`;
+  
+  report += `### File Info\n`;
+  report += `- **Type:** ${binaryInfo.fileType}\n`;
+  report += `- **Architecture:** ${binaryInfo.architecture}\n`;
+  report += `- **Entry Point:** ${binaryInfo.entryPoint}\n\n`;
+  
+  report += `### Sections (${binaryInfo.sections.length})\n`;
+  for (const section of binaryInfo.sections.slice(0, 10)) {
+    report += `- \`${section.name}\` @ ${section.address} (${section.size})\n`;
+  }
+  
+  report += `\n### Security Checks\n`;
+  report += `- **Stack Canary:** ${security.canary ? "✅ Yes" : "❌ No"}\n`;
+  report += `- **NX/DEP:** ${security.nx ? "✅ Enabled" : "❌ Disabled"}\n`;
+  report += `- **PIE:** ${security.pie ? "✅ Enabled" : "❌ Disabled"}\n`;
+  report += `- **Full RELRO:** ${security.relro ? "✅ Yes" : "❌ Partial/No"}\n`;
+  report += `- **RPATH:** ${security.rpath ? "⚠️ Yes" : "✅ No"}\n`;
+  report += `- **RUNPATH:** ${security.runpath ? "⚠️ Yes" : "✅ No"}\n`;
+  report += `- **Symbols:** ${security.symbols ? "⚠️ Present" : "✅ Stripped"}\n`;
+  
+  report += `\n### Interesting Strings (${strings.length} found)\n`;
+  const interesting = strings.filter(s => 
+    /password|passwd|secret|key|token|auth|login|api|https?:\/\//i.test(s)
+  ).slice(0, 30);
+  
+  if (interesting.length > 0) {
+    for (const s of interesting) {
+      report += `- \`${s}\`\n`;
+    }
+  } else {
+    report += `No interesting strings found.\n`;
+  }
+  
+  return report;
+}
+
+async function analyzeWithPEstudio(filePath: string): Promise<string> {
+  let report = `## PE Studio Analysis: ${path.basename(filePath)}\n\n`;
+
+  try {
+    const { stdout: peInfo } = await execAsync(`peinfo "${filePath}" 2>/dev/null || echo "peinfo not available"`);
+    report += `### PE Info\n${peInfo}\n\n`;
+  } catch (e: any) {
+    report += `PE Studio not available: ${e.message}\n`;
+  }
+
+  try {
+    const { stdout: peSection } = await execAsync(`pecheck "${filePath}" 2>/dev/null || objdump -h "${filePath}"`);
+    report += `### Sections\n${peSection}\n\n`;
+  } catch {}
+
+  return report;
+}
+
+async function runDynamicAnalysis(filePath: string, timeout: number = 30): Promise<string> {
+  const sandboxDir = "/tmp/mcp_sandbox";
+  await fs.mkdir(sandboxDir, { recursive: true });
+
+  let report = `## Dynamic Analysis: ${path.basename(filePath)}\n\n`;
+  report += `Timeout: ${timeout}s\n\n`;
+
+  report += `### Behavioral Indicators\n`;
+  
+  const indicators: string[] = [];
+
+  try {
+    const { stdout: strings } = await execAsync(`strings "${filePath}" | head -100`);
+    const suspicious = [
+      /cmd\.exe|wscript|cscript|mshta|powershell/i,
+      /download|execute|http|https|ftp/i,
+      /registry|regedit|HKEY/i,
+      /CreateRemoteThread|VirtualAlloc/i,
+      /OpenProcess|WriteProcessMemory/i
+    ];
+    
+    for (const line of strings.split("\n")) {
+      for (const pattern of suspicious) {
+        if (pattern.test(line)) {
+          indicators.push(`Suspicious: ${line.trim()}`);
+          break;
+        }
+      }
+    }
+  } catch {}
+
+  if (indicators.length > 0) {
+    report += `Detected Indicators:\n`;
+    for (const ind of indicators.slice(0, 20)) {
+      report += `- ${ind}\n`;
+    }
+  } else {
+    report += `No obvious malicious indicators in static strings.\n`;
+  }
+
+  report += `\n### Recommended Dynamic Analysis\n`;
+  report += `- Run in Cuckoo Sandbox for full behavioral analysis\n`;
+  report += `- Use API Monitor to trace Windows API calls\n`;
+  report += `- Monitor with Process Monitor (ProcMon)\n`;
+  report += `- Check with VirusTotal for known signatures\n`;
+
+  return report;
+}
+
+async function analyzeNetworkCapture(pcapFile: string): Promise<string> {
+  let report = `## Network Analysis: ${path.basename(pcapFile)}\n\n`;
+
+  try {
+    const { stdout: stats } = await execAsync(`capinfos "${pcapFile}" 2>/dev/null`);
+    report += `### Capture Info\n${stats}\n\n`;
+  } catch (e: any) {
+    report += `capinfos not available: ${e.message}\n\n`;
+  }
+
+  try {
+    const { stdout: endpoints } = await execAsync(`tshark -r "${pcapFile}" -q -z endpoints,ip 2>/dev/null | head -30`);
+    report += `### IP Endpoints\n${endpoints}\n\n`;
+  } catch {}
+
+  try {
+    const { stdout: conns } = await execAsync(`tshark -r "${pcapFile}" -Y "tcp.flags.syn == 1" -c 20 2>/dev/null`);
+    report += `### TCP Connections\n${conns}\n\n`;
+  } catch {}
+
+  try {
+    const { stdout: dns } = await execAsync(`tshark -r "${pcapFile}" -Y "dns" -T fields -e dns.qry.name 2>/dev/null | sort -u | head -20`);
+    if (dns.trim()) {
+      report += `### DNS Queries\n${dns}\n\n`;
+    }
+  } catch {}
+
+  try {
+    const { stdout: http } = await execAsync(`tshark -r "${pcapFile}" -Y "http.request" -T fields -e http.request.uri -e http.request.host 2>/dev/null | head -20`);
+    if (http.trim()) {
+      report += `### HTTP Requests\n${http}\n\n`;
+    }
+  } catch {}
+
+  report += `### Indicators of Compromise (IOC)\n`;
+  
+  try {
+    const { stdout: susDomains } = await execAsync(`tshark -r "${pcapFile}" -Y "dns" -T fields -e dns.qry.name 2>/dev/null | grep -E "(tk|cc|xyz|top|click|info|pw|ga)" | head -10`);
+    if (susDomains.trim()) {
+      report += `Suspicious domains:\n${susDomains}\n`;
+    }
+  } catch {}
+
+  return report;
+}
+
+async function analyzeMemoryDump(dumpFile: string): Promise<string> {
+  let report = `## Memory Forensics: ${path.basename(dumpFile)}\n\n`;
+
+  report += `### Analysis Tools Available\n`;
+  report += `- Volatility 3 (recommended)\n`;
+  report += `- Rekall\n`;
+  report += `- WinDbg\n\n`;
+
+  const volatilityCmds = [
+    { name: "Process List", cmd: "windows.pslist" },
+    { name: "Network Connections", cmd: "windows.netscan" },
+    { name: "DLLs", cmd: "windows.dlllist" },
+    { name: "Registry Hives", cmd: "windows.registry.hivelist" },
+    { name: "Malfind (injected code)", cmd: "windows.malfind" },
+    { name: "Hashdump", cmd: "windows.hashdump" },
+    { name: "Lsadump", cmd: "windows.lsadump" },
+    { name: "CmdHistory", cmd: "windows.cmdhistory" },
+    { name: "Event Logs", cmd: "windows.evtlog" },
+    { name: "Clipboard", cmd: "windows.clipboard" }
+  ];
+
+  report += `### Volatility 3 Commands\n`;
+  report += "```bash\n";
+  for (const c of volatilityCmds) {
+    report += `vol -f "${dumpFile}" ${c.cmd}\n`;
+  }
+  report += "```\n\n";
+
+  try {
+    const profileCheck = await execAsync(`vol -f "${dumpFile}" imageinfo 2>/dev/null`).then(r => r.stdout).catch(() => "");
+    if (profileCheck) {
+      report += `### Image Info\n${profileCheck}\n\n`;
+    }
+  } catch {}
+
+  report += `### Quick Win Commands\n`;
+  report += "```bash\n";
+  report += `vol -f ${dumpFile} windows.pslist\n`;
+  report += `vol -f ${dumpFile} windows.netscan\n`;
+  report += `vol -f ${dumpFile} windows.malfind\n`;
+  report += `vol -f ${dumpFile} windows.dlllist\n`;
+  report += "```\n";
+
+  return report;
+}
+
+async function analyzeWithRadare2(filePath: string): Promise<string> {
+  let report = `## Radare2 Analysis: ${path.basename(filePath)}\n\n`;
+
+  try {
+    const { stdout: info } = await execAsync(`r2 -c "iI" -c "iM" -c "ij" "${filePath}" 2>/dev/null`);
+    report += `### Binary Info\n${info}\n\n`;
+  } catch (e: any) {
+    report += `Error: ${e.message}\n\n`;
+  }
+
+  try {
+    const { stdout: entry } = await execAsync(`r2 -c "aaa" -c "s entry0" -c "af" -c "pdf" "${filePath}" 2>/dev/null | head -100`);
+    report += `### Entry Point Decompiled\n\`\`\`\n${entry}\n\`\`\`\n\n`;
+  } catch {}
+
+  try {
+    const { stdout: imports } = await execAsync(`r2 -c "ii" "${filePath}" 2>/dev/null | head -30`);
+    report += `### Imports\n${imports}\n\n`;
+  } catch {}
+
+  try {
+    const { stdout: exports } = await execAsync(`r2 -c "iE" "${filePath}" 2>/dev/null | head -30`);
+    report += `### Exports\n${exports}\n\n`;
+  } catch {}
+
+  report += `### Common Radare2 Commands\n`;
+  report += "```bash\n";
+  report += `r2 -A "${filePath}"          # Analyze with all\n`;
+  report += `r2 -c "aaa;afl" "${filePath}"  # List functions\n`;
+  report += `r2 -c "iz" "${filePath}"       # Strings\n`;
+  report += `r2 -c "iI" "${filePath}"       # Binary info\n`;
+  report += `r2 -c "aaa;pdf @ main" "${filePath}"  # Decompile main\n`;
+  report += "```\n";
+
+  return report;
+}
+
+async function debugWithGdb(filePath: string, breakpoint?: string): Promise<string> {
+  let report = `## GDB Debugging: ${path.basename(filePath)}\n\n`;
+
+  const bp = breakpoint || "main";
+
+  report += `### Breakpoint: ${bp}\n\n`;
+
+  try {
+    const gdbScript = [
+      "set pagination off",
+      "set disassembly-flavor intel",
+      `break ${bp}`,
+      "run",
+      "info registers",
+      " disassemble",
+      "continue",
+      "quit"
+    ].join("\n");
+
+    await fs.writeFile("/tmp/mcp_gdb.txt", gdbScript);
+    
+    const { stdout } = await execAsync(`gdb -batch -x /tmp/mcp_gdb.txt "${filePath}" 2>&1`);
+    report += `### GDB Output\n\`\`\`\n${stdout}\n\`\`\`\n\n`;
+  } catch (e: any) {
+    report += `Error: ${e.message}\n`;
+  }
+
+  report += `### Useful GDB Commands\n`;
+  report += "```bash\n";
+  report += `gdb ${filePath}\n`;
+  report += "break main\n";
+  report += "run <args>\n";
+  report += "next / step\n";
+  report += "info registers\n";
+  report += "x/100x \$rip\n";
+  report += "disassemble\n";
+  report += "backtrace\n";
+  report += "```\n";
+
+  return report;
+}
+
 function generateProjectScaffold(language: string, requirements: string): Record<string, string> {
   const files: Record<string, string> = {};
   
@@ -956,6 +1593,121 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ["path"],
         },
       },
+      {
+        name: "ghidra_analyze",
+        description: "Analyze binary with Ghidra (headless mode)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            filePath: { type: "string", description: "Path to binary file" },
+            analysisType: { type: "string", enum: ["basic", "full"], description: "Analysis depth" },
+          },
+          required: ["filePath"],
+        },
+      },
+      {
+        name: "ghidra_decompile",
+        description: "Decompile binary functions with Ghidra",
+        inputSchema: {
+          type: "object",
+          properties: {
+            filePath: { type: "string", description: "Path to binary file" },
+            functionName: { type: "string", description: "Specific function to decompile" },
+          },
+          required: ["filePath"],
+        },
+      },
+      {
+        name: "yara_scan",
+        description: "Scan file with YARA rules for malware indicators",
+        inputSchema: {
+          type: "object",
+          properties: {
+            filePath: { type: "string", description: "Path to file to scan" },
+            rulesPath: { type: "string", description: "Custom YARA rules directory" },
+          },
+          required: ["filePath"],
+        },
+      },
+      {
+        name: "analyze_binary",
+        description: "Static analysis: extract strings, check security (checksec), binary info",
+        inputSchema: {
+          type: "object",
+          properties: {
+            filePath: { type: "string", description: "Path to binary file" },
+          },
+          required: ["filePath"],
+        },
+      },
+      {
+        name: "radare2_analyze",
+        description: "Analyze binary with Radare2 (functions, imports, strings)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            filePath: { type: "string", description: "Path to binary file" },
+          },
+          required: ["filePath"],
+        },
+      },
+      {
+        name: "pestudio_analyze",
+        description: "Analyze PE (Windows) file with PE Studio features",
+        inputSchema: {
+          type: "object",
+          properties: {
+            filePath: { type: "string", description: "Path to PE file" },
+          },
+          required: ["filePath"],
+        },
+      },
+      {
+        name: "dynamic_analysis",
+        description: "Run dynamic/behavioral analysis on suspicious file",
+        inputSchema: {
+          type: "object",
+          properties: {
+            filePath: { type: "string", description: "Path to file to analyze" },
+            timeout: { type: "number", description: "Analysis timeout in seconds" },
+          },
+          required: ["filePath"],
+        },
+      },
+      {
+        name: "network_analysis",
+        description: "Analyze network capture (pcap) for IOCs and traffic",
+        inputSchema: {
+          type: "object",
+          properties: {
+            pcapFile: { type: "string", description: "Path to pcap file" },
+          },
+          required: ["pcapFile"],
+        },
+      },
+      {
+        name: "memory_forensics",
+        description: "Analyze memory dump - provides Volatility commands and quick wins",
+        inputSchema: {
+          type: "object",
+          properties: {
+            dumpFile: { type: "string", description: "Path to memory dump file" },
+          },
+          required: ["dumpFile"],
+        },
+      },
+      {
+        name: "gdb_debug",
+        description: "Debug binary with GDB (set breakpoint, run, inspect)",
+        inputSchema: {
+          type: "object",
+          properties: {
+            filePath: { type: "string", description: "Path to binary" },
+            breakpoint: { type: "string", description: "Breakpoint location (default: main)" },
+          },
+          required: ["filePath"],
+        },
+      },
     ],
   };
 });
@@ -1188,6 +1940,56 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return { content: [{ type: "text", text: result }] };
       }
 
+      case "ghidra_analyze": {
+        const result = await runGhidraAnalyze(args?.filePath as string, args?.analysisType as string || "basic");
+        return { content: [{ type: "text", text: result }] };
+      }
+
+      case "ghidra_decompile": {
+        const result = await decompileWithGhidra(args?.filePath as string, args?.functionName as string | undefined);
+        return { content: [{ type: "text", text: result }] };
+      }
+
+      case "yara_scan": {
+        const result = await scanWithYara(args?.filePath as string, args?.rulesPath as string | undefined);
+        return { content: [{ type: "text", text: `## YARA Scan Results\n\nMatches:\n${result.matches.join("\n")}\n\nRules used: ${result.rules.join(", ")}` }] };
+      }
+
+      case "analyze_binary": {
+        const result = await extractStringsAndAnalyze(args?.filePath as string);
+        return { content: [{ type: "text", text: result }] };
+      }
+
+      case "radare2_analyze": {
+        const result = await analyzeWithRadare2(args?.filePath as string);
+        return { content: [{ type: "text", text: result }] };
+      }
+
+      case "pestudio_analyze": {
+        const result = await analyzeWithPEstudio(args?.filePath as string);
+        return { content: [{ type: "text", text: result }] };
+      }
+
+      case "dynamic_analysis": {
+        const result = await runDynamicAnalysis(args?.filePath as string, args?.timeout as number || 30);
+        return { content: [{ type: "text", text: result }] };
+      }
+
+      case "network_analysis": {
+        const result = await analyzeNetworkCapture(args?.pcapFile as string);
+        return { content: [{ type: "text", text: result }] };
+      }
+
+      case "memory_forensics": {
+        const result = await analyzeMemoryDump(args?.dumpFile as string);
+        return { content: [{ type: "text", text: result }] };
+      }
+
+      case "gdb_debug": {
+        const result = await debugWithGdb(args?.filePath as string, args?.breakpoint as string | undefined);
+        return { content: [{ type: "text", text: result }] };
+      }
+
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
@@ -1198,6 +2000,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     };
   }
 });
+
+console.log(`
+╔══════════════════════════════════════════════════════════════════╗
+║                    MCP RE Server v1.0.0                          ║
+║            Reverse Engineering & Binary Analysis                 ║
+╠══════════════════════════════════════════════════════════════════╣
+║  Tools Available:                                                ║
+║  • ghidra_analyze    • yara_scan        • radare2_analyze       ║
+║  • ghidra_decompile  • analyze_binary   • pestudio_analyze      ║
+║  • dynamic_analysis  • network_analysis • memory_forensics      ║
+║  • gdb_debug         • analyze_project  • review_security       ║
+║  • scaffold_project  • add_docker       • add_tests             ║
+╠══════════════════════════════════════════════════════════════════╣
+║  Environment Variables:                                          ║
+║  • GHIDRA_PATH      - Ghidra installation path                  ║
+║  • YARA_RULES_PATH - Custom YARA rules directory                ║
+╚══════════════════════════════════════════════════════════════════╝
+Server ready on stdio...
+`);
 
 const transport = new StdioServerTransport();
 await server.connect(transport);

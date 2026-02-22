@@ -1,13 +1,14 @@
 {
-  "name": "mcp",
+  "name": "mcp-re-server",
   "version": "1.0.0",
-  "description": "MCP Server for Backend Development",
+  "description": "MCP Server for Reverse Engineering & Backend Development",
   "main": "dist/index.js",
   "type": "module",
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "tsx src/index.ts"
+    "dev": "tsx src/index.ts",
+    "server": "tsx src/index.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",

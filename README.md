@@ -1,51 +1,91 @@
-# Backend MCP Server
+# MCP RE Server
 
-MCP server for backend development with architectural guidance, security analysis, Docker, and testing.
+MCP server for Reverse Engineering & Binary Analysis with backend development tools.
 
-## Tools
+## Features
 
+### Reverse Engineering Tools
 | Tool | Description |
 |------|-------------|
-| `analyze_project` | Analyze structure, language, framework, Docker, database |
-| `review_security` | Scan for hardcoded secrets, SQL injection, XSS, eval() risks |
-| `analyze_api` | List all API endpoints with methods |
-| `validate_api_structure` | Check REST best practices (versioning, health, auth) |
-| `get_architecture_advice` | Architectural recommendations based on requirements |
-| `scaffold_project` | Generate full project with Docker, tests, structure |
-| `add_docker` | Add Docker config to existing project |
-| `add_tests` | Add unit + integration tests |
-| `execute_command`, `read_file`, `write_file`, `list_directory` | File/command operations |
+| `ghidra_analyze` | Analyze binary with Ghidra (headless mode) |
+| `ghidra_decompile` | Decompile binary functions with Ghidra |
+| `yara_scan` | Scan files with YARA rules for malware indicators |
+| `analyze_binary` | Static analysis - extract strings, checksec, binary info |
+| `radare2_analyze` | Analyze with Radare2 (functions, imports, strings) |
+| `pestudio_analyze` | Analyze PE (Windows) files |
+| `dynamic_analysis` | Behavioral analysis on suspicious files |
+| `network_analysis` | Analyze pcap files for IOCs |
+| `memory_forensics` | Memory dump analysis with Volatility commands |
+| `gdb_debug` | Debug binaries with GDB |
 
-## Usage
+### Backend Development Tools
+| Tool | Description |
+|------|-------------|
+| `analyze_project` | Analyze project structure, language, framework |
+| `review_security` | Scan for hardcoded secrets, SQL injection, XSS |
+| `analyze_api` | List all API endpoints |
+| `validate_api_structure` | Check REST best practices |
+| `get_architecture_advice` | Architectural recommendations |
+| `scaffold_project` | Generate project with Docker & tests |
+| `add_docker` | Add Docker configuration |
+| `add_tests` | Add unit & integration tests |
+| `execute_command`, `read_file`, `write_file`, `list_directory` | File operations |
+
+## Quick Start
 
 ```bash
-npm run dev    # Development
-npm run build  # Production build
-npm run start  # Run server
+npm install
+npm run server
 ```
 
-## Configure Claude Desktop
+## Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `GHIDRA_PATH` | Ghidra installation path | `/opt/ghidra` |
+| `YARA_RULES_PATH` | Custom YARA rules directory | `./rules` |
+
+## Usage Examples
+
+```
+- "Analyze binary /path/to/binary with Ghidra"
+- "Scan malware.exe with YARA rules"
+- "Run dynamic analysis on suspicious file"
+- "Analyze network capture traffic.pcap"
+- "Decompile main function from binary"
+- "Check security of my binary (checksec)"
+- "Analyze memory dump memory.dmp"
+- "Debug binary with GDB at main"
+- "Analyze PE file with PE Studio"
+```
+
+## Claude Desktop Config
 
 ```json
 {
   "mcpServers": {
-    "backend": {
+    "mcp-re": {
       "command": "npm",
-      "args": ["run", "start"],
-      "workdir": "/path/to/mcp-server"
+      "args": ["run", "server"],
+      "workdir": "/path/to/mcp"
     }
   }
 }
 ```
 
-## Examples
+## Requirements
 
+### RE Tools (optional)
+- Ghidra - Binary analysis & decompilation
+- YARA - Malware scanning
+- Radare2 - Binary analysis
+- checksec - Binary security checks
+- strings - String extraction
+- Volatility - Memory forensics
+- tshark - Network analysis
+- GDB - Debugging
+
+Install on Kali/RE Linux:
+```bash
+sudo apt install yara radare2 checksec binutils volatility tshark gdb
 ```
-- "Scaffold a TypeScript project with Docker and tests"
-- "Analyze the API structure"
-- "Validate API follows REST best practices"
-- "Add Docker to my project (has PostgreSQL)"
-- "Review security of src/"
-- "Architecture advice for a REST API with auth and PostgreSQL"
-```
-# backend-mcp
